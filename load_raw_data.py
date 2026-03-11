@@ -2,157 +2,147 @@ import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
 import numpy as np
+import sys
 
 # =========================
 # DATABASE CONNECTIE
 # =========================
-
-conn = psycopg2.connect(
-    host="localhost",
-    database="energy_raw",
-    user="energy_user",
-    password="energy_pass",
-    port=5432
-)
-
-cur = conn.cursor()
-print("Connected to database")
+try:
+    conn = psycopg2.connect(
+        host="localhost",
+        database="energy_raw",
+        user="energy_user",
+        password="energy_pass",
+        port=5432
+    )
+    cur = conn.cursor()
+    print("✅ Connected to database")
+except Exception as e:
+    print(f"❌ Database connectie mislukt: {e}")
+    sys.exit()
 
 # =========================
 # FUNCTIES
 # =========================
 
 def read_csv_clean(path):
-    """
-    Robuust CSV inlezen:
-    - Detecteert delimiter
-    - Verwijdert BOM
-    - Verwijdert spaties in kolomnamen
-    """
+    """Leest CSV in en verwijdert witruimte uit kolomnamen."""
+    print(f"⌛ Inlezen van {path}...")
     df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
     df.columns = df.columns.str.strip()
     return df
 
 def convert_kw_to_w(df, year, time_col="Time"):
-    """
-    Zet kW om naar W voor data vóór 6 juni.
-    """
+    """Zet kW om naar W voor data vóór 6 juni."""
     if time_col not in df.columns:
-        raise ValueError(f"Kolom '{time_col}' niet gevonden. Beschikbare kolommen: {df.columns.tolist()}")
+        return df # Overslaan als Time ontbreekt
 
     df[time_col] = pd.to_datetime(df[time_col])
     cutoff = pd.Timestamp(f"{year}-06-06")
 
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    # Zoek numerieke kolommen (behalve Year/Apartment/Tariff)
+    exclude = ["Year", "Apartment", "Tariff"]
+    numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in exclude]
+    
     mask = df[time_col] < cutoff
     df.loc[mask, numeric_cols] = df.loc[mask, numeric_cols] * 1000
     return df
 
 # =========================
-# DISTRICT DATA
+# 1. DISTRICT DATA
 # =========================
+try:
+    district_merged = read_csv_clean("district_merged.csv")
+    district_merged = convert_kw_to_w(district_merged, year=2021)
 
-district_merged = read_csv_clean("district_merged.csv")
-district_merged = convert_kw_to_w(district_merged, year=2021)  # conversie voor alle rijen is veilig
+    cur.execute("DROP TABLE IF EXISTS district_raw;")
+    cur.execute("""
+    CREATE TABLE district_raw (
+        Time TIMESTAMP,
+        Warmtenet DOUBLE PRECISION,
+        Warmtepomp DOUBLE PRECISION,
+        Waterzuivering DOUBLE PRECISION,
+        Vacuum DOUBLE PRECISION,
+        Laadpalen DOUBLE PRECISION,
+        Overig DOUBLE PRECISION,
+        Total DOUBLE PRECISION,
+        Total_calc DOUBLE PRECISION,
+        Year INT
+    );
+    """)
 
-# Check kolommen
-print("District kolommen:", district_merged.columns.tolist())
+    district_rows = [
+        (
+            r.Time, r.Warmtenet, r.Warmtepomp, r.Waterzuivering, 
+            r.Vacuum, r.Laadpalen, r.Overig, r.Total, 
+            getattr(r, 'Total_calc', 0), r.Year
+        )
+        for r in district_merged.itertuples(index=False)
+    ]
 
-# Tabel aanmaken
-cur.execute("DROP TABLE IF EXISTS district_raw;")
-cur.execute("""
-CREATE TABLE district_raw (
-    Time TIMESTAMP,
-    Warmtenet DOUBLE PRECISION,
-    Warmtepomp DOUBLE PRECISION,
-    Waterzuivering DOUBLE PRECISION,
-    Vacuum DOUBLE PRECISION,
-    Laadpalen DOUBLE PRECISION,
-    Overig DOUBLE PRECISION,
-    Total DOUBLE PRECISION,
-    Total_calc DOUBLE PRECISION,
-    Year INT
-);
-""")
-print("District tabel aangemaakt")
+    execute_values(cur, """
+        INSERT INTO district_raw (Time, Warmtenet, Warmtepomp, Waterzuivering, Vacuum, Laadpalen, Overig, Total, Total_calc, Year)
+        VALUES %s
+    """, district_rows)
+    conn.commit()
+    print("✅ District data opgeslagen")
 
-# Bulk insert met execute_values
-district_rows = [
-    (
-        row["Time"],
-        row["Warmtenet"],
-        row["Warmtepomp"],
-        row["Waterzuivering"],
-        row["Vacuum"],
-        row["Laadpalen"],
-        row["Overig"],
-        row["Total"],
-        row.get("Total_calc", 0),  # fallback als ontbreekt
-        row["Year"]
-    )
-    for _, row in district_merged.iterrows()
-]
-
-execute_values(
-    cur,
-    """
-    INSERT INTO district_raw
-    (Time, Warmtenet, Warmtepomp, Waterzuivering, Vacuum, Laadpalen, Overig, Total, Total_calc, Year)
-    VALUES %s
-    """,
-    district_rows
-)
-conn.commit()
-print("District raw data opgeslagen")
+except Exception as e:
+    print(f"❌ Fout bij District data: {e}")
 
 # =========================
-# PRIVATE UNITS DATA
+# 2. PRIVATE UNITS DATA
 # =========================
+try:
+    private_merged = read_csv_clean("private_units_merged.csv")
+    
+    # FIX voor de KeyError: we kijken welke naam de kolom heeft
+    # De kolom in de CSV is waarschijnlijk 'Power_kW' of 'Power'
+    possible_power_cols = ['Power_kW', 'Power_W', 'Power', 'Power_KW']
+    found_power_col = next((c for c in possible_power_cols if c in private_merged.columns), None)
 
-private_merged = read_csv_clean("private_units_merged.csv")
-private_merged = convert_kw_to_w(private_merged, year=2021)  # conversie veilig
+    if not found_power_col:
+        raise KeyError(f"Power kolom niet gevonden! Beschikbaar: {private_merged.columns.tolist()}")
 
-# Tabel aanmaken
-cur.execute("DROP TABLE IF EXISTS private_units_raw;")
-cur.execute("""
-CREATE TABLE private_units_raw (
-    Time TIMESTAMP,
-    Apartment BIGINT,
-    Tariff INT,
-    Power_kW DOUBLE PRECISION,
-    Year INT
-);
-""")
-print("Private units tabel aangemaakt")
+    private_merged = convert_kw_to_w(private_merged, year=2021)
 
-# Bulk insert
-private_rows = [
-    (
-        row["Time"],
-        int(row["Apartment"]),
-        int(row["Tariff"]),
-        row["Power_W"],  # kolomnaam in CSV
-        int(row["Year"])
-    )
-    for _, row in private_merged.iterrows()
-]
+    cur.execute("DROP TABLE IF EXISTS private_units_raw;")
+    cur.execute("""
+    CREATE TABLE private_units_raw (
+        Time TIMESTAMP,
+        Apartment BIGINT,
+        Tariff INT,
+        Power_W DOUBLE PRECISION,
+        Year INT
+    );
+    """)
 
-execute_values(
-    cur,
-    """
-    INSERT INTO private_units_raw
-    (Time, Apartment, Tariff, Power_KW, Year)
-    VALUES %s
-    """,
-    private_rows
-)
-conn.commit()
-print("Private units raw data opgeslagen")
+    # Gebruik itertuples voor snelheid (126MB verwerking)
+    # We gebruiken getattr omdat kolomnamen met hoofdletters/tekens in tuples soms veranderen
+    private_rows = [
+        (
+            pd.to_datetime(r.Time),
+            int(r.Apartment),
+            int(r.Tariff),
+            float(getattr(r, found_power_col)),
+            int(r.Year)
+        )
+        for r in private_merged.itertuples(index=False)
+    ]
+
+    execute_values(cur, """
+        INSERT INTO private_units_raw (Time, Apartment, Tariff, Power_W, Year)
+        VALUES %s
+    """, private_rows)
+    conn.commit()
+    print("✅ Private units data opgeslagen")
+
+except Exception as e:
+    print(f"❌ Fout bij Private units data: {e}")
 
 # =========================
-# CONNECTIE SLUITEN
+# AFSLUITEN
 # =========================
-
 cur.close()
 conn.close()
-print("RAW DATA STORAGE COMPLETE 🚀")
+print("🚀 RAW DATA STORAGE COMPLETE")
